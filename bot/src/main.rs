@@ -228,6 +228,9 @@ struct State {
     registered_tournament: bool,
     /// Tournaments we've asked to register for (auto-registration).
     auto_registered: HashSet<u64>,
+    /// Last match event received (auction, result, balance). Auctions open
+    /// every second, so a long silence mid-match means a stalled connection.
+    last_rx: Option<Instant>,
     /// The match-scope subscription, and ones it replaced that are dropped
     /// once it's applied.
     scope: Option<SubscriptionHandle>,
@@ -572,7 +575,11 @@ fn subscribe_scope<C: RemoteDbContext>(ctx: &C, sh: &Arc<Shared>, me: u64, m0: u
 
 fn on_scope_ready<C: RemoteDbContext>(ctx: &C, sh: &Arc<Shared>, m0: u64) {
     let Some(me) = sh.bot_id() else { return };
-    lock(&sh.st).ready = true;
+    {
+        let mut st = lock(&sh.st);
+        st.ready = true;
+        st.last_rx = Some(Instant::now());
+    }
     let running = my_running_matches(ctx, me);
     log!(
         "READY match_scope>={m0} cached: participants={} matches={} auctions={} rack_rows={} running={running:?}",
@@ -1078,6 +1085,7 @@ fn register_callbacks(conn: &DbConnection, sh: &Arc<Shared>) {
     let s = sh.clone();
     conn.db.auction().on_insert(move |ctx, a| {
         let recv = now_micros();
+        touch_rx(&s);
         guard("auction insert", || {
             if !matches!(a.status, AuctionStatus::Open) {
                 return;
@@ -1095,6 +1103,7 @@ fn register_callbacks(conn: &DbConnection, sh: &Arc<Shared>) {
 
     let s = sh.clone();
     conn.db.auction_result().on_insert(move |ctx, r| {
+        touch_rx(&s);
         guard("auction_result insert", || {
             if is_initial(&ctx.event) {
                 return;
@@ -1230,6 +1239,11 @@ fn reset_connection_state(sh: &Shared) {
     // Handles of the old connection's subscriptions; they ended with it.
     st.scope = None;
     st.old_scopes.clear();
+    st.last_rx = None;
+}
+
+fn touch_rx(sh: &Shared) {
+    lock(&sh.st).last_rx = Some(Instant::now());
 }
 
 fn join_quietly(handle: thread::JoinHandle<()>, wait: Duration) {
@@ -1304,6 +1318,23 @@ fn run_connection(sh: &Arc<Shared>) -> Outcome {
                     let _ = conn.disconnect();
                     join_quietly(handle, Duration::from_secs(3));
                     return Outcome::Retry("subscriptions not ready after 30s".into());
+                }
+                // A running match with no events for a few seconds: the
+                // connection has stalled (seen live: 60 s of silence, then a
+                // close). Reconnect now rather than lose the rest of the match.
+                let stalled = {
+                    let st = lock(&sh.st);
+                    st.ready && st.last_rx.is_some_and(|t| t.elapsed() > Duration::from_millis(3500))
+                };
+                if stalled {
+                    if let Some(me) = sh.bot_id() {
+                        if !my_running_matches(&conn, me).is_empty() {
+                            log!("STALL no match events for 3.5s mid-match; reconnecting");
+                            let _ = conn.disconnect();
+                            join_quietly(handle, Duration::from_secs(2));
+                            return Outcome::Retry("stalled connection".into());
+                        }
+                    }
                 }
                 // Covers a cancelled lobby, a join that bounced, a missed end.
                 guard("watchdog", || maybe_join_lobby(&conn, sh, "watchdog"));
