@@ -47,6 +47,15 @@ pub struct Params {
     pub nodes: u32,
     /// First-price: scale on the Vickrey-era competing-bid table.
     pub fp_scale: f64,
+    /// 0: pace on balance / bref. 1: pace on balance / planned balance, where
+    /// the plan spends bref evenly over the usable auctions (plus `plan_floor`).
+    pub pace_mode: f64,
+    pub plan_floor: f64,
+    /// 1: future tiles in the Monte Carlo are the k most wanted of the
+    /// upcoming auctions (we pick what we bid for), not k random ones.
+    pub sel: f64,
+    /// Max tiles missing for a long word to count as a target.
+    pub sel_miss: f64,
 }
 
 impl Default for Params {
@@ -68,6 +77,10 @@ impl Default for Params {
             cands: 160,
             nodes: 2500,
             fp_scale: 0.85,
+            pace_mode: 0.0,
+            plan_floor: 20.0,
+            sel: 0.0,
+            sel_miss: 3.0,
         }
     }
 }
@@ -95,6 +108,10 @@ impl Params {
                 "cands" => self.cands = f as usize,
                 "nodes" => self.nodes = f as u32,
                 "fp_scale" => self.fp_scale = f,
+                "pace_mode" => self.pace_mode = f,
+                "plan_floor" => self.plan_floor = f,
+                "sel" => self.sel = f,
+                "sel_miss" => self.sel_miss = f,
                 _ => return Err(format!("unknown param {k}")),
             }
         }
@@ -250,6 +267,48 @@ impl SmartStrategy {
         v
     }
 
+    /// Marginal points with selection: each sample draws the next `m`
+    /// auction tiles and we keep the `k` most wanted for each arm's rack.
+    pub fn marginal_sel(&mut self, rack: &R8, l: usize, pool: &[u8], k: usize, m: usize) -> f64 {
+        let m = m.min(pool.len());
+        let k = k.min(m);
+        if k == 0 {
+            return self.marginal(rack, l, pool, 0);
+        }
+        let mut rl = *rack;
+        rl[l] += 1;
+        let miss = self.p.sel_miss as u32;
+        let d_r = self.eng.desirability(rack, miss);
+        let d_rl = self.eng.desirability(&rl, miss);
+        let n = self.p.samples.max(1);
+        let mut pool = pool.to_vec();
+        let mut tot = 0.0;
+        let mut cand: Vec<(f32, u8)> = Vec::with_capacity(m);
+        for _ in 0..n {
+            for j in 0..m {
+                let r = j + self.rng.below(pool.len() - j);
+                pool.swap(j, r);
+            }
+            let mut arm = |d: &[f32; 26], base: &R8, rng: &mut Rng| -> R8 {
+                cand.clear();
+                for &c in &pool[..m] {
+                    let jitter = (rng.unit() as f32) * 1e-3;
+                    cand.push((d[c as usize] + jitter, c));
+                }
+                cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let mut out = *base;
+                for &(_, c) in cand.iter().take(k) {
+                    out[c as usize] += 1;
+                }
+                out
+            };
+            let without_r = arm(&d_r, rack, &mut self.rng);
+            let with_r = arm(&d_rl, &rl, &mut self.rng);
+            tot += self.value(&with_r) as f64 - self.value(&without_r) as f64;
+        }
+        tot / n as f64
+    }
+
     /// Marginal points of adding tile `l` to `rack`, with `k` future tiles.
     pub fn marginal(&mut self, rack: &R8, l: usize, pool: &[u8], k: usize) -> f64 {
         let k = k.min(pool.len());
@@ -315,9 +374,19 @@ impl SmartStrategy {
         let useful_future = c.bag_remaining.saturating_sub(1);
         let k = ((useful_future as f64 * self.p.p_win).round() as usize).min(self.p.kmax);
         let pool = self.pool(c.match_id);
-        let marg = self.marginal(&rack, l, &pool, k);
+        let marg = if self.p.sel >= 1.0 {
+            self.marginal_sel(&rack, l, &pool, k, useful_future as usize)
+        } else {
+            self.marginal(&rack, l, &pool, k)
+        };
         let bal = c.my_balance.max(0) as f64;
-        let mut rate = self.p.r0 * (bal.max(1.0) / self.p.bref).powf(self.p.gamma);
+        let reference = if self.p.pace_mode >= 1.0 {
+            // Planned balance: spend down linearly to the floor by the end.
+            self.p.plan_floor + (self.p.bref - self.p.plan_floor) * (useful_future as f64 / 66.0).min(1.0)
+        } else {
+            self.p.bref
+        };
+        let mut rate = self.p.r0 * (bal.max(1.0) / reference).powf(self.p.gamma);
         if useful_future <= self.p.end_rounds {
             rate *= self.p.end_mult;
         }

@@ -231,6 +231,9 @@ struct State {
     /// Last match event received (auction, result, balance). Auctions open
     /// every second, so a long silence mid-match means a stalled connection.
     last_rx: Option<Instant>,
+    /// Last reconnect made to repair the server's `connected` flag (kept
+    /// across connections, to rate-limit those reconnects).
+    last_flag_refresh: Option<Instant>,
     /// The match-scope subscription, and ones it replaced that are dropped
     /// once it's applied.
     scope: Option<SubscriptionHandle>,
@@ -1029,6 +1032,14 @@ fn register_callbacks(conn: &DbConnection, sh: &Arc<Shared>) {
         })
     });
 
+    conn.db.bot_credential().on_update(move |ctx, old, new| {
+        guard("bot_credential update", || {
+            if ctx.try_identity() == Some(new.identity) && old.connected != new.connected {
+                log!("CRED_FLAG connected={}", new.connected);
+            }
+        })
+    });
+
     let s = sh.clone();
     conn.db.match_participant().on_insert(move |ctx, p| {
         guard("match_participant insert", || {
@@ -1334,6 +1345,36 @@ fn run_connection(sh: &Arc<Shared>) -> Outcome {
                             join_quietly(handle, Duration::from_secs(2));
                             return Outcome::Retry("stalled connection".into());
                         }
+                    }
+                }
+                // The module keeps one `connected` flag per identity. A stale
+                // connection the server reaps late (after we've reconnected)
+                // sets it to false while we're online, and the website then
+                // shows the bot offline. A fresh connect sets it again: do that
+                // between matches, at most once a minute.
+                let (conn_age, last_refresh, ident) = {
+                    let st = lock(&sh.st);
+                    (
+                        if st.ready { st.connected_at.map(|t| t.elapsed()) } else { None },
+                        st.last_flag_refresh,
+                        st.identity,
+                    )
+                };
+                if conn_age.is_some_and(|d| d > Duration::from_secs(5))
+                    && last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(60))
+                {
+                    let off = ident
+                        .and_then(|id| conn.db.bot_credential().identity().find(&id))
+                        .is_some_and(|c| !c.connected);
+                    let in_match = sh.bot_id().is_some_and(|me| !my_running_matches(&conn, me).is_empty());
+                    if off && !in_match {
+                        lock(&sh.st).last_flag_refresh = Some(Instant::now());
+                        log!("CRED_FLAG_OFF server shows us offline while connected; reconnecting to refresh it");
+                        let _ = conn.disconnect();
+                        join_quietly(handle, Duration::from_secs(2));
+                        // Let the server process our close before the new connect.
+                        thread::sleep(Duration::from_millis(1500));
+                        return Outcome::Retry("refresh connected flag".into());
                     }
                 }
                 // Covers a cancelled lobby, a join that bounced, a missed end.

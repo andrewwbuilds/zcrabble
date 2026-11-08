@@ -154,7 +154,12 @@ static PAIRS: std::sync::OnceLock<Vec<Vec<Vec<(u16, u16)>>>> = std::sync::OnceLo
 fn comp_bid(l: usize, round: u32, rng: &mut Rng) -> i64 {
     let t = PAIRS.get_or_init(|| {
         let mut t = vec![vec![Vec::new(); 8]; 26];
-        for line in include_str!("../../../data/prices2_r6.txt").lines() {
+        let src = if std::env::var("SIM_FRESH").is_ok() {
+            include_str!("../../../data/prices2_fresh.txt")
+        } else {
+            include_str!("../../../data/prices2_r6.txt")
+        };
+        for line in src.lines() {
             let mut it = line.split_whitespace();
             let li = engine::idx(it.next().unwrap().chars().next().unwrap()).unwrap();
             let p: usize = it.next().unwrap().parse().unwrap();
@@ -202,12 +207,19 @@ fn main() {
     let eng: &'static Engine = Box::leak(Box::new(Engine::load()));
     let prices: &'static PriceTable = Box::leak(Box::new(PriceTable::load()));
     let opp: &'static Vec<i64> = Box::leak(Box::new(
-        include_str!("../../../data/oppmax_r6.txt")
-            .split_whitespace()
+        (if std::env::var("SIM_FRESH").is_ok() {
+            include_str!("../../../data/oppmax_fresh.txt")
+        } else {
+            include_str!("../../../data/oppmax_r6.txt")
+        })
+        .split_whitespace()
             .filter_map(|x| x.parse().ok())
             .collect(),
     ));
-    let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(8).min(16);
+    let threads = std::env::var("SIM_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(8).min(16));
     let t0 = std::time::Instant::now();
     let mut hs = Vec::new();
     for t in 0..threads {

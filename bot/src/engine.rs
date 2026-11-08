@@ -93,6 +93,8 @@ pub struct Word {
 pub struct Engine {
     /// Sorted by reward desc, then length desc, then text.
     pub words: Vec<Word>,
+    /// Indices of 7-8 letter words (targets for rack building).
+    pub long_idx: Vec<u32>,
 }
 
 impl Engine {
@@ -125,7 +127,13 @@ impl Engine {
                 .then(a.text.cmp(&b.text))
         });
         words.dedup_by(|a, b| a.text == b.text);
-        Engine { words }
+        let long_idx = words
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| (7..=8).contains(&w.len))
+            .map(|(i, _)| i as u32)
+            .collect();
+        Engine { words, long_idx }
     }
 
     pub fn load() -> Engine {
@@ -179,6 +187,36 @@ impl Engine {
     /// Just the value of the best set.
     pub fn value(&self, rack: &R8, max_cands: usize, node_limit: u32) -> u32 {
         self.best_set(rack, max_cands, node_limit).0
+    }
+
+    /// How much each letter is wanted to complete long (7-8 letter) words
+    /// that `rack` is at most `max_missing` tiles away from, weighted by
+    /// reward and closeness.
+    pub fn desirability(&self, rack: &R8, max_missing: u32) -> [f32; 26] {
+        let mut d = [0f32; 26];
+        let rmask = rack_mask(rack);
+        for &wi in &self.long_idx {
+            let w = &self.words[wi as usize];
+            if (w.mask & !rmask).count_ones() > max_missing {
+                continue;
+            }
+            let mut miss = 0u32;
+            for i in 0..26 {
+                if w.counts[i] > rack[i] {
+                    miss += (w.counts[i] - rack[i]) as u32;
+                }
+            }
+            if miss == 0 || miss > max_missing {
+                continue;
+            }
+            let wt = w.reward as f32 / (miss * miss) as f32;
+            for i in 0..26 {
+                if w.counts[i] > rack[i] {
+                    d[i] += wt * (w.counts[i] - rack[i]) as f32;
+                }
+            }
+        }
+        d
     }
 
     pub fn word(&self, i: u32) -> &Word {
