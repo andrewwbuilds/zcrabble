@@ -1,0 +1,7 @@
+target/
+.token
+*.token
+e2e/tokens/
+e2e/.stdb/
+e2e/logs/
+logs/

@@ -1,0 +1,4 @@
+tokens/
+.stdb/
+logs/
+__pycache__/

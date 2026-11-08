@@ -1,0 +1,15 @@
+[package]
+name = "zcrabble-bot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ScrabbleBot client: connects to the SpacetimeDB module, joins lobbies, bids and plays words."
+
+[[bin]]
+name = "zcrabble-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the CLI that generated src/module_bindings (spacetime 2.14.1).
+# Regenerate the bindings when bumping this.
+spacetimedb-sdk = "=2.14.1"
